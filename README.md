@@ -12,7 +12,6 @@ System architecture:
 
 [SPS30 Sensor] → [ESP32] → [Firebase Firestore] → [Flutter Mobile App]
 
-Code
 
 ---
 
@@ -39,21 +38,21 @@ Code
 ---
 
 ## 📁 Repository Structure
-/
-├── firmware/                # ESP32 + SPS30 firmware
-│   ├── src/
-│   ├── wiring-diagram.png
-│   └── README.md
-│
-├── firebase/                # Firebase configuration
-│   ├── firestore.rules
-│   ├── firestore.indexes.json
-│   └── example-data.json
-│
-└── flutter_app/             # Flutter mobile application
-├── lib/
-├── assets/screenshots/
-└── README.md
+/  
+├── firmware/                # ESP32 + SPS30 firmware  
+│  ├── src/  
+│  ├── wiring-diagram.png  
+│  └── README.md  
+│  
+├── firebase/                # Firebase configuration  
+│   ├── firestore.rules  
+│   ├── firestore.indexes.json  
+│   └── example-data.json  
+│  
+└── flutter_app/             # Flutter mobile application  
+├── lib/  
+├── assets/screenshots/  
+└── README.md  
 
 ---
 
