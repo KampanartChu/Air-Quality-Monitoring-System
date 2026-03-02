@@ -1,1 +1,12 @@
-Config_private.h
+
+# Arduino
+**/Config_private.h
+
+# Firebase
+**/firebase_options.dart
+**/google-services.json
+**/GoogleService-Info.plist
+**/firebase.json
+
+# Env
+**/.env
