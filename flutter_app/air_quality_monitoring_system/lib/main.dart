@@ -1,15 +1,18 @@
-import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_database/firebase_database.dart';
-import 'package:intl/intl.dart';
-import 'firebase_options.dart';
+import 'dart:async';
 
-void main() async {
+import 'package:air_quality_monitoring_system/firebase_options.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/material.dart';
+import 'package:fl_chart/fl_chart.dart';
+
+import 'package:intl/intl.dart';
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-
   runApp(const MyApp());
 }
 
@@ -18,29 +21,50 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
+    return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: HomePage(),
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: Colors.blue,
+        brightness: Brightness.dark,
+      ),
+      home: const DustDashboard(),
     );
   }
 }
 
-class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+class DustDashboard extends StatefulWidget {
+  const DustDashboard({super.key});
 
   @override
-  State<HomePage> createState() => _HomePageState();
+  State<DustDashboard> createState() => _DustDashboardState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _DustDashboardState extends State<DustDashboard> {
   Map<String, dynamic>? latestData;
   String lastUpdate = "Loading...";
   final formatter = DateFormat('dd/MMM/yyyy HH:mm:ss');
+
+  String selectedType = "PM2.5";
+
+  Map<String, double> currentValues = {"PM1.0": 0, "PM2.5": 0, "PM10": 0};
+  Map<String, List<double>> history = {"PM1.0": [], "PM2.5": [], "PM10": []};
+  StreamSubscription<DatabaseEvent>? _subscription;
 
   @override
   void initState() {
     super.initState();
     init();
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    super.dispose();
+  }
+
+  List<double> extractList(List<Map<String, dynamic>> records, String key) {
+    return records.map<double>((e) => (e[key] ?? 0).toDouble()).toList();
   }
 
   Future<void> init() async {
@@ -52,123 +76,193 @@ class _HomePageState extends State<HomePage> {
     final ref = FirebaseDatabase.instance
         .ref("logs/sps30")
         .orderByKey()
-        .limitToLast(1);
+        .limitToLast(10);
 
-    ref.onValue.listen((event) {
+    _subscription = ref.onValue.listen((event) {
       if (!mounted) return;
+      if (event.snapshot.value == null) return;
 
-      if (event.snapshot.value != null) {
-        final data = event.snapshot.value as Map;
-        final latest = data.values.first as Map;
+      final data = Map<String, dynamic>.from(event.snapshot.value as Map);
 
-        int ts = latest["timestamp"];
+      List<Map<String, dynamic>> records = data.values
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
 
-        DateTime time = DateTime.fromMillisecondsSinceEpoch(
-          ts * 1000,
-          isUtc: true,
-        ).toLocal();
+      records.sort(
+        (a, b) => (a["timestamp"] ?? 0).compareTo(b["timestamp"] ?? 0),
+      );
 
-        setState(() {
-          latestData = Map<String, dynamic>.from(latest);
-          lastUpdate = formatter.format(time);
-        });
-      }
+      final latest = records.last;
+
+      int ts = latest["timestamp"] ?? 0;
+
+      DateTime time = DateTime.fromMillisecondsSinceEpoch(
+        ts * 1000,
+        isUtc: true,
+      ).toLocal();
+
+      setState(() {
+        latestData = latest;
+        lastUpdate = formatter.format(time);
+
+        currentValues["PM1.0"] = (latest["mc_1p0"] ?? 0).toDouble();
+        currentValues["PM2.5"] = (latest["mc_2p5"] ?? 0).toDouble();
+        currentValues["PM10"] = (latest["mc_10p0"] ?? 0).toDouble();
+
+        history["PM1.0"] = extractList(records, "mc_1p0");
+        history["PM2.5"] = extractList(records, "mc_2p5");
+        history["PM10"] = extractList(records, "mc_10p0");
+      });
     });
   }
 
-  Widget buildCard(String title, dynamic value, String unit) {
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          children: [
-            Text(
-              title,
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              value?.toString() ?? "--",
-              style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold),
-            ),
-            Text(unit, style: const TextStyle(fontSize: 16)),
-          ],
-        ),
-      ),
-    );
+  bool isOnline() {
+    if (latestData == null) return false;
+
+    int ts = latestData!["timestamp"] ?? 0;
+    final dataTime = DateTime.fromMillisecondsSinceEpoch(
+      ts * 1000,
+      isUtc: true,
+    ).toLocal();
+
+    return DateTime.now().difference(dataTime).inMinutes <= 20;
+  }
+
+  Color getAQIColor(double value) {
+    if (value <= 25) return Colors.green;
+    if (value <= 50) return Colors.yellow;
+    if (value <= 100) return Colors.orange;
+    return Colors.red;
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          "ESP8266 + SPS30 Air monitor",
-          style: TextStyle(fontSize: 12),
-        ),
+        title: const Text("Air Quality Dashboard"),
         actions: [
-          TextButton(
-            onPressed: () {
-              // ยังไม่ทำอะไร
-            },
-            child: const Text("History"),
+          Padding(
+            padding: const EdgeInsets.only(right: 16),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.circle,
+                  size: 12,
+                  color: isOnline() ? Colors.green : Colors.red,
+                ),
+                const SizedBox(width: 6),
+                Text(isOnline() ? "Online" : "Offline"),
+              ],
+            ),
           ),
         ],
       ),
       body: latestData == null
           ? const Center(child: CircularProgressIndicator())
-          : LayoutBuilder(
-              builder: (context, constraints) {
-                return SingleChildScrollView(
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      minHeight: constraints.maxHeight,
-                    ),
-                    child: IntrinsicHeight(
-                      child: Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              buildCard(
-                                "PM1.0",
-                                latestData!["mc_1p0"],
-                                "µg/m³",
+          : Column(
+              children: [
+                // 🔵 Top Cards
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: currentValues.keys.map((type) {
+                      final isSelected = type == selectedType;
+                      return Expanded(
+                        child: GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              selectedType = type;
+                            });
+                          },
+                          child: Card(
+                            elevation: isSelected ? 8 : 2,
+                            color: isSelected
+                                ? getAQIColor(currentValues[type] ?? 0)
+                                : Colors.grey[900],
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 20),
+                              child: Column(
+                                children: [
+                                  Text(
+                                    type,
+                                    style: const TextStyle(fontSize: 16),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    currentValues[type]!.toStringAsFixed(1),
+                                    style: const TextStyle(
+                                      fontSize: 24,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(height: 12),
-                              buildCard(
-                                "PM2.5",
-                                latestData!["mc_2p5"],
-                                "µg/m³",
-                              ),
-                              const SizedBox(height: 12),
-                              buildCard(
-                                "PM10",
-                                latestData!["mc_10p0"],
-                                "µg/m³",
-                              ),
-                              const SizedBox(height: 12),
-                              buildCard(
-                                "Particle Size",
-                                latestData!["typical_size"],
-                                "µm",
-                              ),
-                              const SizedBox(height: 30),
-                              Text(
-                                "Last Update: $lastUpdate",
-                                style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    "Last update: $lastUpdate",
+                    style: const TextStyle(color: Colors.grey),
+                  ),
+                ),
+                // 🔵 Chart
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Card(
+                      elevation: 6,
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: LineChart(
+                          LineChartData(
+                            gridData: FlGridData(show: true),
+                            borderData: FlBorderData(show: false),
+                            titlesData: FlTitlesData(show: false),
+                            lineTouchData: LineTouchData(
+                              touchTooltipData: LineTouchTooltipData(),
+                            ),
+                            lineBarsData: [
+                              LineChartBarData(
+                                spots: (history[selectedType] ?? [])
+                                    .asMap()
+                                    .entries
+                                    .map(
+                                      (e) => FlSpot(e.key.toDouble(), e.value),
+                                    )
+                                    .toList(),
+                                isCurved: true,
+                                gradient: const LinearGradient(
+                                  colors: [Colors.blue, Colors.cyan],
+                                ),
+                                barWidth: 4,
+                                dotData: FlDotData(show: false),
+                                belowBarData: BarAreaData(
+                                  show: true,
+                                  gradient: LinearGradient(
+                                    colors: [
+                                      Colors.blue.withOpacity(0.3),
+                                      Colors.transparent,
+                                    ],
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                  ),
+                                ),
                               ),
                             ],
                           ),
+                          duration: const Duration(milliseconds: 300),
                         ),
                       ),
                     ),
                   ),
-                );
-              },
+                ),
+              ],
             ),
     );
   }
