@@ -2,6 +2,8 @@
 #include <WiFiClientSecureBearSSL.h>
 #include <ESP8266HTTPClient.h>
 #include <time.h>
+#include <Wire.h>
+#include <sps30.h>
 #include "Config_private.h"
 
 /* =========================================================
@@ -48,7 +50,6 @@ static BearSSL::X509List cert(rootCACert);
 /* =========================================================
    GLOBAL VARIABLES
    ========================================================= */
-
 BearSSL::WiFiClientSecure client;
 HTTPClient https;
 
@@ -59,9 +60,6 @@ String refreshToken;
 // เวลา token หมดอายุ
 unsigned long tokenExpire = 0;
 
-// เวลาเขียนข้อมูลล่าสุด
-unsigned long lastSend = 0;
-
 // เวลาเริ่มบูต (ใช้รีบูตทุก 24 ชม.)
 unsigned long bootTime = 0;
 
@@ -70,6 +68,9 @@ unsigned long lastAttempt = 0;
 
 // ใช้ตรวจว่าเริ่ม NTP แล้วหรือยัง
 bool ntpStarted = false;
+
+// Sync ตามเวลาโลกจริง
+unsigned long lastLoggedSlot = 0;
 
 
 /* =========================================================
@@ -81,7 +82,38 @@ enum SystemState {
   STATE_LOGIN,   // Login Firebase
   STATE_RUNNING  // ทำงานปกติ
 };
+
 SystemState currentState = STATE_WIFI;
+
+/* =========================================================
+   SPS30 STATE
+   ========================================================= */
+enum SPSState {
+  SPS_IDLE,
+  SPS_START,
+  SPS_WARMUP,
+  SPS_READ,
+  SPS_STOP
+};
+
+SPSState spsState = SPS_IDLE;
+
+unsigned long spsTimer = 0;
+unsigned long lastSlot = 0;
+int readCount = 0;
+
+float sum_mc1 = 0;
+float sum_mc25 = 0;
+float sum_mc4 = 0;
+float sum_mc10 = 0;
+
+float sum_nc05 = 0;
+float sum_nc1 = 0;
+float sum_nc25 = 0;
+float sum_nc4 = 0;
+float sum_nc10 = 0;
+
+float sum_size = 0;
 
 
 /* =========================================================
@@ -187,12 +219,12 @@ void checkToken() {
 /* =========================================================
    WRITE DATA TO FIREBASE
    ========================================================= */
-void pushData(const String &path, const String &json) {
+void pushData(const String &path, const char *json) {
+
+  checkToken();
 
   if (currentState != STATE_RUNNING) return;
   if (idToken.length() < 50) return;  // token ปกติยาวมาก
-
-  checkToken();
 
   String url =
     String(DATABASE_URL) + path + ".json?auth=" + idToken;
@@ -202,17 +234,159 @@ void pushData(const String &path, const String &json) {
   https.begin(client, url);
   https.addHeader("Content-Type", "application/json");
 
-  // int code = https.PUT(value);
   int code = https.POST(json);
 
-  if (code == 401) {
+
+  if (code == 200) {
+    Serial.printf("POST OK: %d\n", code);
+  } else if (code == 401) {
     Serial.println("Token Invalid → Relogin");
     currentState = STATE_LOGIN;
   } else if (code != HTTP_CODE_OK) {
-    Serial.printf("PUT Fail: %d\n", code);
+    Serial.printf("POST Fail: %d\n", code);
   }
 
   https.end();
+}
+
+/* =========================================================
+   SPS30 Handle
+   ========================================================= */
+void handleSPS30() {
+
+  time_t now = time(nullptr);
+  if (now < 1000000000) return;
+
+  unsigned long slot = now / 900;  // 15 นาที
+
+  switch (spsState) {
+
+    case SPS_IDLE:
+
+      if (slot != lastSlot) {
+        sum_mc1 = sum_mc25 = sum_mc4 = sum_mc10 = 0;
+        sum_nc05 = sum_nc1 = sum_nc25 = sum_nc4 = sum_nc10 = 0;
+        sum_size = 0;
+        readCount = 0;
+
+        lastSlot = slot;
+
+        sps30_start_measurement();
+        spsTimer = millis();
+        spsState = SPS_WARMUP;
+        Serial.println("SPS → Start Warmup");
+      }
+      break;
+
+    case SPS_WARMUP:
+      
+      if (millis() - spsTimer >= 30000) {  // warmup 30 วิ
+        readCount = 0;
+        spsTimer = millis();
+        spsState = SPS_READ;
+        Serial.println("SPS → Reading...");
+      }
+      break;
+
+    case SPS_READ:
+      
+      if (millis() - spsTimer >= 2000) {  // read
+
+        struct sps30_measurement m;
+
+        if (sps30_read_measurement(&m) == 0) {
+
+          if (!isnan(m.mc_2p5)) {
+
+            sum_mc1 += m.mc_1p0;
+            sum_mc25 += m.mc_2p5;
+            sum_mc4 += m.mc_4p0;
+            sum_mc10 += m.mc_10p0;
+
+            sum_nc05 += m.nc_0p5;
+            sum_nc1 += m.nc_1p0;
+            sum_nc25 += m.nc_2p5;
+            sum_nc4 += m.nc_4p0;
+            sum_nc10 += m.nc_10p0;
+
+            sum_size += m.typical_particle_size;
+
+            readCount++;
+          }
+        }
+
+        spsTimer = millis();
+
+        if (readCount >= 3) {
+          spsState = SPS_STOP;
+          Serial.println("SPS → Stopped");
+        }
+      }
+      break;
+
+    case SPS_STOP:
+      
+      if (readCount == 0) {
+        spsState = SPS_IDLE;
+        break;
+      }
+
+      sps30_stop_measurement();
+
+      float avg_mc1 = sum_mc1 / readCount;
+      float avg_mc25 = sum_mc25 / readCount;
+      float avg_mc4 = sum_mc4 / readCount;
+      float avg_mc10 = sum_mc10 / readCount;
+
+      float avg_nc05 = sum_nc05 / readCount;
+      float avg_nc1 = sum_nc1 / readCount;
+      float avg_nc25 = sum_nc25 / readCount;
+      float avg_nc4 = sum_nc4 / readCount;
+      float avg_nc10 = sum_nc10 / readCount;
+
+      float avg_size = sum_size / readCount;
+
+      // ยิง Firestore ตรงนี้เลย
+      char json[512];
+      snprintf(json, sizeof(json),
+               "{\"mc_1p0\":%.2f,"
+               "\"mc_2p5\":%.2f,"
+               "\"mc_4p0\":%.2f,"
+               "\"mc_10p0\":%.2f,"
+               "\"nc_0p5\":%.2f,"
+               "\"nc_1p0\":%.2f,"
+               "\"nc_2p5\":%.2f,"
+               "\"nc_4p0\":%.2f,"
+               "\"nc_10p0\":%.2f,"
+               "\"typical_size\":%.2f,"
+               "\"timestamp\":%ld}",
+               avg_mc1,
+               avg_mc25,
+               avg_mc4,
+               avg_mc10,
+               avg_nc05,
+               avg_nc1,
+               avg_nc25,
+               avg_nc4,
+               avg_nc10,
+               avg_size,
+               (long)now);
+
+      pushData("logs/sps30", json);
+
+      struct tm *t = localtime(&now);
+      char timeStr[30];
+      strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", t);
+      Serial.println(timeStr);
+
+      sum_mc1 = sum_mc25 = sum_mc4 = sum_mc10 = 0;
+      sum_nc05 = sum_nc1 = sum_nc25 = sum_nc4 = sum_nc10 = 0;
+      sum_size = 0;
+      readCount = 0;
+
+      spsState = SPS_IDLE;
+      break;
+  }
 }
 
 
@@ -237,6 +411,12 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
 
+  Wire.begin(D2, D1);  // ESP8266 I2C
+  sensirion_i2c_init();
+  if (sps30_probe() != 0) {
+    Serial.println("SPS30 not detected at boot");
+  }
+
   bootTime = millis();
 }
 
@@ -255,7 +435,7 @@ void loop() {
         Serial.println("WIFI OK");
         currentState = STATE_TIME;
         ntpStarted = false;
-      } else if (millis() - lastAttempt > 5000) {
+      } else if (millis() - lastAttempt > 10000) {
         Serial.println("Retry WiFi...");
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         lastAttempt = millis();
@@ -329,37 +509,12 @@ void loop() {
       // ถ้า WiFi หลุด → กลับไปเริ่มใหม่
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi Lost");
+        spsState = SPS_IDLE;  // reset sensor state
         currentState = STATE_WIFI;
         break;
       }
 
-      // ส่งข้อมูลทุก 10 วินาที
-      if (millis() - lastSend > 10000) {  //900000 = 15 min
-        lastSend = millis();
-
-        char json[256];
-        time_t now = time(nullptr);
-
-        snprintf(json, sizeof(json),
-                 "{\"nc_0p5\":%.2f,"
-                 "\"nc_1p0\":%.2f,"
-                 "\"nc_2p5\":%.2f,"
-                 "\"nc_4p0\":%.2f,"
-                 "\"nc_10p0\":%.2f,"
-                 "\"typical_size\":%.2f,"
-                 "\"timestamp\":%lu}",
-                0.5,//  m.nc_0p5,
-                1.0,//  m.nc_1p0,
-                2.5,//  m.nc_2p5,
-                4.0,//  m.nc_4p0,
-                10.0,//  m.nc_10p0,
-                99,//  m.typical_particle_size,
-                 now);
-
-        // writeData("esp/value", "30");
-        pushData("logs/sps30", String(json));
-        Serial.println("SEND OK");
-      }
+      handleSPS30();
 
       // Debug Heap
       static unsigned long lastHeap = 0;
