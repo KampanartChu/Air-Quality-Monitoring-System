@@ -75,22 +75,19 @@ bool ntpStarted = false;
 /* =========================================================
    STATE MACHINE
    ========================================================= */
-
 enum SystemState {
   STATE_WIFI,    // กำลังเชื่อม WiFi
   STATE_TIME,    // กำลัง Sync เวลา
   STATE_LOGIN,   // Login Firebase
   STATE_RUNNING  // ทำงานปกติ
 };
-
 SystemState currentState = STATE_WIFI;
 
 
 /* =========================================================
    STRING PARSER (ดึงค่าจาก JSON แบบประหยัด RAM)
    ========================================================= */
-
-String extractValue(String source, const char *key) {
+String extractValue(const String &source, const char *key) {
 
   int start = source.indexOf(key);
   if (start == -1) return "";
@@ -106,16 +103,13 @@ String extractValue(String source, const char *key) {
 /* =========================================================
    LOGIN FIREBASE
    ========================================================= */
-
 bool loginFirebase() {
-
-  client.setTrustAnchors(&cert);
-  client.setBufferSizes(512, 512);  // ลด RAM usage
 
   String url =
     String("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=") + API_KEY;
 
-  https.useHTTP10(true);  // ลด RAM
+  https.useHTTP10(true);   // ลด RAM
+  https.setTimeout(5000);  // 5 วินาที
   https.begin(client, url);
   https.addHeader("Content-Type", "application/json");
 
@@ -145,15 +139,13 @@ bool loginFirebase() {
 /* =========================================================
    REFRESH TOKEN
    ========================================================= */
-
 bool refreshFirebase() {
-
-  client.setTrustAnchors(&cert);
 
   String url =
     String("https://securetoken.googleapis.com/v1/token?key=") + API_KEY;
 
   https.useHTTP10(true);
+  https.setTimeout(5000);  // 5 วินาที
   https.begin(client, url);
   https.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
@@ -183,10 +175,11 @@ bool refreshFirebase() {
 /* =========================================================
    CHECK TOKEN (เรียกก่อนใช้งาน Firebase ทุกครั้ง)
    ========================================================= */
-
 void checkToken() {
   if (millis() > tokenExpire - 60000) {
-    refreshFirebase();  // ต่ออายุล่วงหน้า 1 นาที
+    if (!refreshFirebase()) {
+      currentState = STATE_LOGIN;  // กลับไป login ใหม่
+    }
   }
 }
 
@@ -194,21 +187,30 @@ void checkToken() {
 /* =========================================================
    WRITE DATA TO FIREBASE
    ========================================================= */
+void pushData(const String &path, const String &json) {
 
-void writeData(const String &path, const String &value) {
+  if (currentState != STATE_RUNNING) return;
+  if (idToken.length() < 50) return;  // token ปกติยาวมาก
 
   checkToken();
-
-  client.setTrustAnchors(&cert);
 
   String url =
     String(DATABASE_URL) + path + ".json?auth=" + idToken;
 
   https.useHTTP10(true);
+  https.setTimeout(5000);  // 5 วินาที
   https.begin(client, url);
   https.addHeader("Content-Type", "application/json");
 
-  https.PUT(value);
+  // int code = https.PUT(value);
+  int code = https.POST(json);
+
+  if (code == 401) {
+    Serial.println("Token Invalid → Relogin");
+    currentState = STATE_LOGIN;
+  } else if (code != HTTP_CODE_OK) {
+    Serial.printf("PUT Fail: %d\n", code);
+  }
 
   https.end();
 }
@@ -217,7 +219,6 @@ void writeData(const String &path, const String &value) {
 /* =========================================================
    SETUP
    ========================================================= */
-
 void setup() {
 
   Serial.begin(115200);
@@ -226,6 +227,16 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  client.setTrustAnchors(&cert);
+  client.setBufferSizes(512, 512);  // ลด RAM usage
+
+  idToken.reserve(1200);
+  refreshToken.reserve(600);
+
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
   bootTime = millis();
 }
 
@@ -233,13 +244,11 @@ void setup() {
 /* =========================================================
    LOOP (STATE MACHINE)
    ========================================================= */
-
 void loop() {
 
   switch (currentState) {
 
       /* ================= WIFI ================= */
-
     case STATE_WIFI:
 
       if (WiFi.status() == WL_CONNECTED) {
@@ -256,47 +265,65 @@ void loop() {
 
 
       /* ================= TIME ================= */
-
     case STATE_TIME:
+
+      static unsigned long timeStart = 0;  // << ประกาศตรงนี้
 
       if (WiFi.status() != WL_CONNECTED) {
         currentState = STATE_WIFI;
         break;
       }
 
+      // เริ่มจับเวลาเมื่อเข้า STATE_TIME ครั้งแรก
+      if (timeStart == 0) {
+        timeStart = millis();
+      }
+
       // เริ่ม NTP ครั้งเดียว
       if (!ntpStarted) {
         Serial.println("Start NTP");
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        // configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov"); //Thai offset
         ntpStarted = true;
       }
 
-      // รอจนได้เวลา Unix จริง
+      // ได้เวลาแล้ว
       if (time(nullptr) > 1000000000) {
         Serial.println("TIME OK");
+        timeStart = 0;  // รีเซ็ตตัวจับเวลา
         currentState = STATE_LOGIN;
+        break;
+      }
+
+      // ⛔ Timeout 10 วินาที
+      if (millis() - timeStart > 10000) {
+        Serial.println("TIME FAIL → Retry");
+        ntpStarted = false;
+        timeStart = 0;  // รีเซ็ตเพื่อเริ่มใหม่
       }
 
       break;
 
 
       /* ================= LOGIN ================= */
-
     case STATE_LOGIN:
 
-      if (loginFirebase()) {
-        Serial.println("LOGIN OK");
-        currentState = STATE_RUNNING;
-      } else {
-        Serial.println("LOGIN FAIL");
-        delay(2000);  // retry ช้า ๆ
+      static unsigned long lastLoginAttempt = 0;
+
+      if (millis() - lastLoginAttempt > 2000) {
+        lastLoginAttempt = millis();
+        if (loginFirebase()) {
+          Serial.println("LOGIN OK");
+          currentState = STATE_RUNNING;
+        } else {
+          Serial.println("LOGIN FAIL");
+        }
       }
 
       break;
 
 
       /* ================= RUNNING ================= */
-
     case STATE_RUNNING:
 
       // ถ้า WiFi หลุด → กลับไปเริ่มใหม่
@@ -307,18 +334,44 @@ void loop() {
       }
 
       // ส่งข้อมูลทุก 10 วินาที
-      if (millis() - lastSend > 10000) {
+      if (millis() - lastSend > 10000) {  //900000 = 15 min
         lastSend = millis();
 
-        writeData("esp/value", "30");
+        char json[256];
+        time_t now = time(nullptr);
+
+        snprintf(json, sizeof(json),
+                 "{\"nc_0p5\":%.2f,"
+                 "\"nc_1p0\":%.2f,"
+                 "\"nc_2p5\":%.2f,"
+                 "\"nc_4p0\":%.2f,"
+                 "\"nc_10p0\":%.2f,"
+                 "\"typical_size\":%.2f,"
+                 "\"timestamp\":%lu}",
+                0.5,//  m.nc_0p5,
+                1.0,//  m.nc_1p0,
+                2.5,//  m.nc_2p5,
+                4.0,//  m.nc_4p0,
+                10.0,//  m.nc_10p0,
+                99,//  m.typical_particle_size,
+                 now);
+
+        // writeData("esp/value", "30");
+        pushData("logs/sps30", String(json));
         Serial.println("SEND OK");
+      }
+
+      // Debug Heap
+      static unsigned long lastHeap = 0;
+      if (millis() - lastHeap > 60000) {
+        lastHeap = millis();
+        Serial.printf("Heap: %u\n", ESP.getFreeHeap());
       }
 
       break;
   }
 
   /* ================= DAILY REBOOT ================= */
-
   // รีบูตทุก 24 ชั่วโมง (เพิ่มเสถียรภาพภาคสนาม)
   if (millis() - bootTime > 86400000UL) {
     Serial.println("Daily Reboot");
